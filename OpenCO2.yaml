@@ -7,7 +7,7 @@ esphome:
   on_shutdown:
     priority: 700
     then:
-      - light.turn_off: status_led    # Send software OFF command
+      - light.turn_off: status_led  # 💡 FIX: Send software OFF command
       - delay: 50ms                   # Wait briefly
       - switch.turn_off: LED_power    # Then cut hardware power
       - switch.turn_off: EPD_power
@@ -67,7 +67,7 @@ switch:
       # When turning on, rely on the 1s interval to set color/brightness
     
     on_turn_off: 
-      - light.turn_off: status_led  # Send software OFF command first
+      - light.turn_off: status_led # 💡 FIX: Send software OFF command first
       - delay: 50ms                 # Give the software command time to execute
       - switch.turn_off: LED_power  # Then cut hardware power
   - platform: gpio
@@ -341,7 +341,6 @@ display:
         it.printf(20, 159, id(font_degree), TextAlign::TOP_LEFT, "%d%%", battery_pct);
       }
 
-# Download Bahnschrift - Regular font and copy to the fonts folder in your ESPHome installation
 font:
   # Temperature/Humidity - bahn 60pt
   - file: 'fonts/bahn.ttf'
@@ -361,9 +360,11 @@ font:
     bpp: 4
     glyphs: [
       0123456789,
-      °, ., C, F, m, p,
+      °, ., C, F, m, p, d, B,
       "\u0020",
-      "\u0025"
+      "\u0025",
+      "\u003A",
+      "\u002D"
       ]    
     extras:
       - file: "https://cdnjs.cloudflare.com/ajax/libs/MaterialDesign-Webfont/7.4.47/fonts/materialdesignicons-webfont.ttf"
