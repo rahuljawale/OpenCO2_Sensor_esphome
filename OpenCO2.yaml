@@ -4,60 +4,72 @@ esphome:
     priority: -100
     then:
       - script.execute: set_state_empty
-  on_shutdown: #works when going to sleep
+  on_shutdown:
     priority: 700
     then:
-      - switch.turn_off: LED_power
+      - light.turn_off: status_led  # 💡 FIX: Send software OFF command
+      - delay: 50ms                   # Wait briefly
+      - switch.turn_off: LED_power    # Then cut hardware power
       - switch.turn_off: EPD_power
 
 esp32:
   board: lolin_s2_mini
   variant: esp32s2
+  framework:
+    type: esp-idf
 
 wifi:
-  fast_connect: true #no network scan, connect directly
-  power_save_mode: HIGH #change to LIGHT or remove if there are connection problems.
-  ssid: !secret wifi_home_ssid
-  password: !secret wifi_home_pass
-  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: HIGH
   ap:
     ssid: "ESP32_openCO2"
-    password: "esp32s2openco2"
+    password: !secret hotspot_password
 
+web_server:
+  port: 80
+  log: false
+  version: 3
+  
 captive_portal:
-
-# Enable logging
-logger:
-  level: NONE 
-  # DEBUG, NONE, INFO
-
-# Enable Home Assistant API
 api:
-
 ota:
+  - platform: esphome
+logger:
+  level: INFO
 
 deep_sleep:
   id: deep_sleep_1
-#  run_duration:
-#    default: 65s #will be put to sleep by the sensor automation in 30s
-#    gpio_wakeup_reason: 10min
-#  wakeup_pin_mode: KEEP_AWAKE
-#  wakeup_pin:
-#    number: 0
-#    inverted: true
-#    mode:
-#      input: true
-#      pullup: true
-#https://esphome.io/components/deep_sleep.html?highlight=deep_sleep
+  # Wakeup on button press
+  wakeup_pin:
+    number: GPIO0
+    inverted: true
+    mode:
+      input: true
+      pullup: true
 
 switch:
   - platform: gpio
     id: LED_power
     name: LED power
-    pin: 9
+    pin: GPIO9
     inverted: true
-    #restore_mode: ALWAYS_ON
     internal: true
+  # Add LED enable/disable switch
+  - platform: template
+    name: "LED Enable"
+    id: led_enable
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - switch.turn_on: LED_power # Turn on hardware power
+      # When turning on, rely on the 1s interval to set color/brightness
+    
+    on_turn_off: 
+      - light.turn_off: status_led # 💡 FIX: Send software OFF command first
+      - delay: 50ms                 # Give the software command time to execute
+      - switch.turn_off: LED_power  # Then cut hardware power
   - platform: gpio
     pin: 45
     id: EPD_power
@@ -66,19 +78,61 @@ switch:
     restore_mode: ALWAYS_ON
     internal: true
 
-#binary_sensor:
-#  - platform: gpio
-#    pin: 0
-#    name: "OpenCO2 button"
-#    id: btn0
-#    internal: true
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Asia/Kolkata
+
+light:
+  - platform: spi_led_strip
+    id: status_led
+    name: "Status LED"
+    spi_id: led_spi
+    num_leds: 1
+    data_rate: 5MHz
+    internal: true
+    default_transition_length: 0s
+    color_correct: [25%, 25%, 25%]
+    #brightness: 
+
+interval:
+  - interval: 1s
+    then:
+      # Execute LED update script continuously only if USB is connected
+      - if:
+          condition:
+            sensor.in_range:
+              id: usb_adc
+              above: 1.0
+          then:
+            - script.execute: update_led_color
+
+text_sensor:
+  - platform: template
+    name: Open CO2 state
+    id: system_state
+    internal: true
+
+i2c:
+  - sda: GPIO33
+    scl: GPIO34
+    scan: false
+    id: bus_a
+
+spi:
+  - clk_pin: 41
+    mosi_pin: 21
+    id: disp_spi
+  # Second SPI bus for LED (software SPI)
+  - clk_pin: GPIO39
+    mosi_pin: GPIO40
+    id: led_spi
 
 sensor:
   - platform: scd4x
     id: my_scd40
     measurement_mode: low_power_periodic
-    update_interval: 30s
-    temperature_offset: 0.0
+    update_interval: 1min
     co2:
       name: "ppm CO2"
       id: scd40_ppm
@@ -88,21 +142,24 @@ sensor:
     humidity:
       name: "SDC40 Humidity"
       id: scd40_rh
-      on_value: #on last entry, so temperature and ppm is known.
+      on_value:
         if:
           condition:
             sensor.in_range:
               id: usb_adc
-              below: 1.0
+              below: 1.0  # Battery mode
           then:
-          - component.update: EPD
-          - delay: 5s
-          - deep_sleep.enter:
-              id: deep_sleep_1
-              sleep_duration: 5min
+            - delay: 3s
+            - component.update: EPD
+            - delay: 5s  # Let display finish updating
+            - deep_sleep.enter:
+                id: deep_sleep_1
+                sleep_duration: 15min  # Sleep for 5 minutes on battery
           else:
-          - component.update: EPD
-          - delay: 5s
+            # On USB power - just update display, don't sleep
+            - delay: 3s
+            - component.update: EPD
+
   - platform: adc
     pin: 5
     name: "OpenCO2 BattV"
@@ -112,12 +169,13 @@ sensor:
     filters:
       - multiply: 2
     on_value_range:
-      - below: 3.35
+      - below: 3.35  # Low battery shutdown
         then:
           - script.execute: set_state_discharged
           - component.update: EPD
           - delay: 6s
           - script.execute: low_battery_shutdown
+
   - platform: adc
     pin: 4
     attenuation: 11db
@@ -126,66 +184,75 @@ sensor:
     update_interval: 15s
     internal: true
     on_value_range:
-      - above: 1.0
+      - above: 1.0  # USB connected
         then:
           - deep_sleep.prevent: deep_sleep_1
-      - below: 0.8
+      - below: 0.8  # USB disconnected
         then:
           - deep_sleep.allow: deep_sleep_1
-          - script.execute: set_state_empty
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_signal_strength
+    update_interval: 60s
+    internal: true
 
 script:
   - id: set_state_empty
     then:
       lambda: |-
-        if(analogRead(4)<1024) //if USB is present, update display directly.
-          id(system_state).publish_state("___ Open CO2 ___");
-        else {
+        if(id(usb_adc).state > 1.0)
           id(system_state).publish_state("___ Open CO2 USB ___");
-          id(EPD).update();
-        }
+        else
+          id(system_state).publish_state("___ Open CO2 ___");
+  
   - id: set_state_discharged
     then:
       lambda: |-
         id(system_state).publish_state("DISCHARGED!!!");
+  
   - id: low_battery_shutdown
     then:
       lambda: |-
-        ESP_LOGD("vbat","Low batt / charger analogRead %0.3f ,if below 1V, shutdown", id(usb_adc).state);
-        if(id(usb_adc).state<1.0) //charger not present 4095 full scale
-        {
-          esp_deep_sleep_start(); //never wake up - only by RESET
-          ESP_LOGE("vbat", "Low Power Supply %.3fV! Sleeping to protect battery", id(battV).state);
-        } 
-        else
-        {
-          ESP_LOGI("vbat","On charger, staying on.");
+        if(id(usb_adc).state < 1.0) {
+          esp_deep_sleep_start();  // Never wake up - only via reset
         }
+  - id: update_led_color
+    then:
+      - lambda: |-
+          // 1. Check conditions to DISABLE/POWER OFF LED
+          if (id(usb_adc).state < 1.0 || !id(led_enable).state) {
+            // FIX: The on_shutdown and on_turn_off handlers manage the physical power switch.
+            // This script should only send the software OFF command here.
+            auto call = id(status_led).turn_off();
+            call.perform();
+            return;
+          }
 
-i2c:
-  sda: 33
-  scl: 34
-  scan: false
-  id: bus_a
-
-font:
-    - file: 'config\esphome\arial.ttf'
-      id: font1
-      size: 20
-    
-    - file: 'config\esphome\BebasNeue-Regular.ttf'
-      id: font2
-      size: 30
-    
-    - file: 'config\esphome\arial.ttf'
-      id: font3
-      size: 65
-
-spi:
-  clk_pin: 41
-  mosi_pin: 21
-  id: disp_spi
-
+          // 2. Logic for smooth color transition (from Arduino sketch)
+          // Ensure hardware power is ON (controlled by 'LED Enable' switch)
+          // We rely on the 'LED Enable' switch's on_turn_on action to power this ON. 
+          
+          int co2 = (int)id(scd40_ppm).state;
+          int red = 0, green = 0, blue = 0;
+          float brightness_pct = 1.0; // Assuming max brightness if no number component used
+          
+          // ... (Color and math logic remains the same)
+          if (co2 > 2000) {
+            red = 216; green = 2; blue = 131;
+          } else {
+            red = std::round(std::pow((co2 - 400), 2) / 10000);
+            green = std::round(-std::pow((co2 - 400), 2) / 4500 + 255);
+            
+            red = std::max(0, std::min(255, red));
+            green = std::max(0, std::min(255, green));
+          }
+          
+          auto call = id(status_led).turn_on();
+          call.set_rgb((float)red/255.0, (float)green/255.0, (float)blue/255.0);
+          call.set_brightness(brightness_pct);
+          call.perform();
+          
 display:
   - platform: waveshare_epaper
     spi_id: disp_spi
@@ -198,46 +265,119 @@ display:
     reset_duration: 2ms
     model: 1.54inv2
     update_interval: never
-    full_update_every: 1 #has to be 1, full update every update. Partial did not work.
+    full_update_every: 1
     lambda: |-
-      //it.printf(100, 0, id(font1), TextAlign::TOP_CENTER , "%s",  id(current_ip).state.c_str());
-      it.printf(100, 0, id(font1), TextAlign::TOP_CENTER , "%s",  id(system_state).state.c_str());
-      it.printf(100, 15, id(font3), TextAlign::TOP_CENTER , "%.0f", id(scd40_ppm).state);
-      it.printf(100, 85, id(font2), TextAlign::TOP_CENTER , "%.1f °C", id(scd40_t).state);
-      it.printf(100, 125, id(font2), TextAlign::TOP_CENTER , "%.0f RH", id(scd40_rh).state);
-      it.printf(100, 165, id(font2), TextAlign::TOP_CENTER , "%.2f V", id(battV).state);
+      // Top: Temperature (left) and Humidity (right)
+      // Temperature whole number
+      it.printf(1, 5, id(font_temp_hum), TextAlign::TOP_LEFT, "%.0f", id(scd40_t).state);
+      it.printf(65, 5, id(font_degree), TextAlign::TOP_LEFT, "°C");
       
+      // Temperature decimal on second line
+      int temp_decimal = ((int)(id(scd40_t).state * 10)) % 10;
+      it.printf(65, 27, id(font_degree), TextAlign::TOP_LEFT, " .%d", temp_decimal);
+      
+      // Humidity
+      it.printf(124, 5, id(font_temp_hum), TextAlign::TOP_LEFT, "%.0f", id(scd40_rh).state);
+      it.printf(184, 5, id(font_degree), TextAlign::TOP_LEFT, "%%");
+      
+      // Center: Large CO2 - matching Arduino positioning exactly
+      int co2_value = (int)id(scd40_ppm).state;
+      if (co2_value > 9999) {
+        it.printf(27, 78, id(font_co2_medium), TextAlign::TOP_LEFT, "%d", co2_value);
+      } else if (co2_value < 1000) {
+        // 3 digits
+        it.printf(40, 65, id(font_co2_xlarge), TextAlign::TOP_LEFT, "%.0f", id(scd40_ppm).state);
+      } else {
+        // 4 digits
+        it.printf(35, 65, id(font_co2_xlarge), TextAlign::TOP_LEFT, "%.0f", id(scd40_ppm).state);
+      }
+      
+      // Bottom: "ppm" label
+      it.printf(144, 130, id(font_ppm), TextAlign::TOP_LEFT, "ppm");
+      
+      // Bottom left: WiFi/Time on USB, Battery on battery
+      if (id(usb_adc).state > 1.0) {
+        auto time = id(sntp_time).now();
+        if (time.is_valid()) {
+          it.strftime(5, 170, id(font_degree), TextAlign::TOP_LEFT, "%H:%M", time);
+        }
+        if (id(wifi_signal_strength).has_state()) {
+          // Calculate signal level (1-4) from dBm for icon selection
+          int rssi = (int)id(wifi_signal_strength).state;
+          int strength;
+          if (rssi >= -67) {
+            strength = 4; // Excellent
+          } else if (rssi >= -70) {
+            strength = 3; // Good
+          } else if (rssi >= -80) {
+            strength = 2; // Fair
+          } else if (rssi >= -90) {
+            strength = 1; // Weak
+          } else {
+            strength = 0; // Very Weak
+          }
 
-text_sensor:
-#  - platform: wifi_info
-#    ip_address:
-#      name: ESP IP Address
-#      id: current_ip
-  - platform: template
-    name: Open CO2 state
-    id: system_state
-    internal: true
+          // C++ Ternary operators to select the correct Unicode icon glyph
+          const char* wifi_icon = 
+              (strength == 4) ? "󰤨" :  // Strength 4
+              (strength == 3) ? "󰤥" :  // Strength 3
+              (strength == 2) ? "󰤢" :  // Strength 2
+              (strength == 1) ? "󰤟" :  // Strength 1
+                                "󰤮";   // Strength 0 (outline/off)
+                  
+          // Display the icon and dBm value
+          it.printf(75, 170, id(font_degree), TextAlign::TOP_LEFT, "%s %.0fdBm", wifi_icon, id(wifi_signal_strength).state);
 
-#light:
-#  - platform: neopixelbus
-#    #method: ESP32_I2S_0
-#    type: BRG
-#    variant: DotStar
-#    data_pin: 40
-#    clock_pin: 39
-#    num_leds: 1
-#    name: "LED"
-#    id: "led_rgb"
+        }
+      } else {
+        float voltage = id(battV).state;
+        int battery_pct = 100;
+        if (voltage < 3.2) battery_pct = 0;
+        else if (voltage < 3.6) battery_pct = (voltage - 3.2) / 0.4 * 50;
+        else if (voltage < 4.2) battery_pct = 50 + (voltage - 3.6) / 0.6 * 50;
+        
+        it.rectangle(1, 153, 91, 35);
+        it.rectangle(92, 161, 5, 19);
+        it.printf(20, 159, id(font_degree), TextAlign::TOP_LEFT, "%d%%", battery_pct);
+      }
 
-##blink
-#interval:
-#  - interval: 15s
-#    then:
-#      - light.turn_on:
-#          id: led_rgb
-#          brightness: 100%
-#          red: 0
-#          green: 100%
-#          blue: 0.1
-#      - delay: 5s
-#      - light.turn_off: led_rgb    
+font:
+  # Temperature/Humidity - BebasNeue 30pt (Arduino font2)
+  - file: 'fonts/bahn.ttf'
+    id: font_temp_hum
+    size: 60
+    glyphs: [
+      0123456789,
+      °, ., C, F, m, p,
+      "\u0020",
+      "\u0025"
+      ]
+    
+  # Degree symbols and small text - Arial 24pt (Arduino sml)
+  - file: 'fonts/bahn.ttf'
+    id: font_degree
+    size: 28
+    bpp: 4
+    extras:
+      - file: "fonts/materialdesignicons-webfont.ttf"
+        glyphs: [
+          "\U000F091F", # mdi-heart
+          "\U000F0922", # mdi-wifi-strength-2
+          "\U000F0925", # mdi-wifi-strength-3
+          "\U000F0928" # mdi-wifi-strength-4
+          ]
+    
+  # CO2 extra large - Arial 65pt (Arduino font3/big)
+  - file: 'fonts/bahn.ttf'
+    id: font_co2_xlarge
+    size: 80
+    
+  # CO2 medium for >9999 - BebasNeue 45pt (Arduino mid)
+  - file: 'fonts/bahn.ttf'
+    id: font_co2_medium
+    size: 45
+    
+  # "ppm" label - Arial 24pt
+  - file: 'fonts/bahn.ttf'
+    id: font_ppm
+    size: 22
