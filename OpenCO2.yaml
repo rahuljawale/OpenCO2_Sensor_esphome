@@ -19,13 +19,13 @@ esp32:
     type: esp-idf
 
 wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
+  ssid: !secret wifi_ssid # Use your own secrets variable
+  password: !secret wifi_password # Use your own secrets variable
   fast_connect: true
   power_save_mode: HIGH
   ap:
     ssid: "ESP32_openCO2"
-    password: !secret hotspot_password
+    password: !secret hotspot_password # Use your own secrets variable
 
 web_server:
   port: 80
